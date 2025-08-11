@@ -1,5 +1,6 @@
 import os, json, time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import gspread
 from coinbase.rest import RESTClient
@@ -12,14 +13,31 @@ TARGET_GAIN_PCT = float(os.getenv("TARGET_GAIN_PCT", "5.0"))
 SLEEP_SEC       = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.8"))
 POLL_SEC        = float(os.getenv("POLL_INTERVAL_SEC", "0.8"))
 POLL_TRIES      = int(os.getenv("POLL_MAX_TRIES", "25"))
+DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
 
-CB = RESTClient()
+CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
 
-def now_iso(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# ---------- utils ----------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def g(obj: Any, *names: str, default=None):
+    """Get first present attr/key from an object or dict."""
+    for n in names:
+        if isinstance(obj, dict):
+            if n in obj and obj[n] not in (None, ""):
+                return obj[n]
+        else:
+            v = getattr(obj, n, None)
+            if v not in (None, ""):
+                return v
+    return default
 
 def get_gc():
-    raw = os.getenv("GOOGLE_CREDS_JSON"); 
-    if not raw: raise RuntimeError("Missing GOOGLE_CREDS_JSON")
+    raw = os.getenv("GOOGLE_CREDS_JSON")
+    if not raw:
+        raise RuntimeError("Missing GOOGLE_CREDS_JSON")
     return gspread.service_account_from_dict(json.loads(raw))
 
 def _ws(gc, tab):
@@ -32,70 +50,89 @@ def ensure_log(ws):
     if not ws.get_all_values():
         ws.append_row(["Timestamp","Action","Product","ProceedsUSD","Qty","OrderID","Status","Note"])
 
+
+# ---------- sheet cost basis ----------
 def read_cost(ws):
     vals = ws.get_all_values()
-    if not vals or len(vals) < 2: return []
-    hdr = [h.strip() for h in vals[0]]
+    if not vals or len(vals) < 2:
+        return []
     out = []
     for r in vals[1:]:
-        if not any(r): continue
+        if not any(r): 
+            continue
         try:
             out.append({
                 "product": r[0].strip().upper(),
                 "qty": float(r[1] or 0.0),
                 "dollar_cost": float(r[2] or 0.0),
+                "rownum": len(out) + 2,  # sheet row number (1-indexed)
             })
-        except: pass
+        except:
+            pass
     return out
 
+def zero_cost_row(ws, rownum: int, product: str):
+    ws.update(f"A{rownum}:E{rownum}", [[product, "0", "0", "0", now_iso()]])
+
+
+# ---------- market data / orders ----------
 def price_now(product_id: str) -> float:
-    p = CB.get_product(product_id=product_id)
-    # defensive: price could be in 'price' or nested
-    price = p.get("price") if isinstance(p, dict) else getattr(p, "price", None)
-    if price is None and isinstance(p, dict) and "product" in p and "price" in p["product"]:
-        price = p["product"]["price"]
-    return float(price)
+    """Use last CLOSED 1-minute candle close as 'spot'."""
+    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start_dt = end_dt - timedelta(minutes=10)
+    resp = CB.get_candles(
+        product_id=product_id,
+        start=int(start_dt.timestamp()),
+        end=int(end_dt.timestamp()),
+        granularity="ONE_MINUTE",
+    )
+    rows = g(resp, "candles") or (resp if isinstance(resp, list) else [])
+    if not rows:
+        raise RuntimeError("No recent candles")
+    # Take the last item’s close
+    last = rows[-1]
+    close = g(last, "close")
+    if close is None:
+        raise RuntimeError("No close in last candle")
+    return float(close)
 
 def place_sell(product_id: str, base_qty: float) -> str:
+    if DRY_RUN:
+        return "DRYRUN"
     o = CB.market_order_sell(client_order_id="", product_id=product_id, base_size=f"{base_qty:.12f}")
-    return o.get("order_id", "") if isinstance(o, dict) else getattr(o, "order_id", "")
+    return g(o, "order_id", "id", default="")
 
 def poll_fills_proceeds(order_id: str) -> float:
     """Return total USD proceeds for this order (best-effort)."""
-    total = 0.0
+    if DRY_RUN:
+        return 0.0
     for _ in range(POLL_TRIES):
         try:
             f = CB.get_fills(order_id=order_id)
-            fills = f.get("fills", f) if isinstance(f, dict) else f.fills
+            fills = g(f, "fills") or (f if isinstance(f, list) else [])
             if fills:
-                # prefer quote_value if present
-                s = 0.0
+                total = 0.0
                 for x in fills:
-                    qv = x.get("quote_value")
-                    if qv:
-                        s += float(qv)
+                    qv = g(x, "quote_value", "commissionable_value")
+                    if qv is not None:
+                        total += float(qv)
                     else:
-                        px = float(x.get("price", 0.0)); sz = float(x.get("size", 0.0))
-                        s += px * sz
-                if s > 0:
-                    return s
+                        px = float(g(x, "price", default=0) or 0)
+                        sz = float(g(x, "size", default=0) or 0)
+                        total += px * sz
+                if total > 0:
+                    return total
         except Exception:
             pass
         time.sleep(POLL_SEC)
-    return total
+    return 0.0
 
-def update_cost_after_full_exit(ws, product: str):
-    vals = ws.get_all_values()
-    for r in range(1, len(vals)):
-        if vals[r][0].strip().upper() == product:
-            # zero it out
-            ws.update(f"A{r+1}:E{r+1}", [[product, "0", "0", "0", now_iso()]])
-            return
 
+# ---------- main ----------
 def main():
     print("🏁 crypto-seller starting")
     gc = get_gc()
-    ws_log  = _ws(gc, LOG_TAB); ensure_log(ws_log)
+    ws_log  = _ws(gc, LOG_TAB);  ensure_log(ws_log)
     ws_cost = _ws(gc, COST_TAB)
 
     target = TARGET_GAIN_PCT / 100.0
@@ -107,7 +144,8 @@ def main():
     logs = []
     for row in cost_rows:
         pid = row["product"]; qty = row["qty"]; dollar_cost = row["dollar_cost"]
-        if qty <= 0 or dollar_cost <= 0: continue
+        if qty <= 0 or dollar_cost <= 0:
+            continue
 
         try:
             px = price_now(pid)
@@ -117,9 +155,13 @@ def main():
             if gain >= target:
                 oid = place_sell(pid, qty)
                 proceeds = poll_fills_proceeds(oid)
-                realized = proceeds - dollar_cost if proceeds > 0 else mkt - dollar_cost
-                logs.append([now_iso(), "CRYPTO-SELL", pid, f"{proceeds:.2f}", f"{qty:.12f}", oid, "submitted", f"Gain {gain*100:.2f}% | Profit ${realized:.2f}"])
-                update_cost_after_full_exit(ws_cost, pid)
+                realized = (proceeds if proceeds > 0 else mkt) - dollar_cost
+                status = "dry-run" if DRY_RUN else "submitted"
+                logs.append([now_iso(), "CRYPTO-SELL", pid, f"{proceeds:.2f}" if proceeds else f"{mkt:.2f}", f"{qty:.12f}", oid, status, f"Gain {gain*100:.2f}% | Profit ${realized:.2f}"])
+
+                if not DRY_RUN:
+                    zero_cost_row(ws_cost, row["rownum"], pid)
+
                 time.sleep(SLEEP_SEC)
             else:
                 logs.append([now_iso(), "CRYPTO-SELL-SKIP", pid, f"{mkt:.2f}", f"{qty:.12f}", "", "SKIPPED", f"Gain {gain*100:.2f}% < {TARGET_GAIN_PCT:.2f}%"])
@@ -130,5 +172,11 @@ def main():
         ws_log.append_rows(logs[i:i+100], value_input_option="USER_ENTERED")
     print("✅ crypto-seller done")
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("❌ Fatal error:", e)
+        traceback.print_exc()
