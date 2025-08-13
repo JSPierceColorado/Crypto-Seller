@@ -1,6 +1,7 @@
-import os, json, time, random, re
+import os, json, time, random
 from datetime import datetime, timedelta, timezone
 from typing import Any, List
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 import gspread
 from coinbase.rest import RESTClient
@@ -18,8 +19,13 @@ POLL_SEC        = float(os.getenv("POLL_INTERVAL_SEC", "0.8"))
 POLL_TRIES      = int(os.getenv("POLL_MAX_TRIES", "25"))
 DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
 DEBUG_PRICE     = os.getenv("DEBUG_PRICE", "").lower() in ("1","true","yes")
+DEBUG_SELLER    = os.getenv("DEBUG_SELLER", "").lower() in ("1","true","yes")
 
 CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
+
+# Decimal config
+getcontext().prec = 28
+getcontext().rounding = ROUND_DOWN
 
 # Logging layout
 HEADERS = ["Timestamp","Action","Product","ProceedsUSD","Qty","OrderID","Status","Note"]
@@ -33,7 +39,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def g(obj: Any, *names: str, default=None):
-    """Get first present attribute/key from an object or dict."""
     for n in names:
         if isinstance(obj, dict):
             if n in obj and obj[n] not in (None, ""):
@@ -58,17 +63,15 @@ def _ws(gc, tab):
         return sh.add_worksheet(title=tab, rows="2000", cols="50")
 
 def ensure_log(ws):
-    # Ensure exact header in A1:H1 and freeze it
     vals = ws.get_values("A1:H1")
     if not vals or vals[0] != HEADERS:
-        ws.update("A1:H1", [HEADERS])
+        ws.update(range_name="A1:H1", values=[HEADERS])
     try:
         ws.freeze(rows=1)
     except Exception:
         pass
 
 def append_logs(ws, rows: List[List[str]]):
-    # Force exactly 8 columns per row and anchor to A:H.
     fixed = []
     for r in rows:
         if len(r) < 8:
@@ -77,7 +80,6 @@ def append_logs(ws, rows: List[List[str]]):
             r = r[:8]
         fixed.append(r)
     try:
-        # Preferred: append anchored to our table (prevents offset drift)
         for i in range(0, len(fixed), 100):
             ws.append_rows(
                 fixed[i:i+100],
@@ -85,7 +87,6 @@ def append_logs(ws, rows: List[List[str]]):
                 table_range=TABLE_RANGE
             )
     except TypeError:
-        # Fallback for older gspread versions without table_range
         start_row = len(ws.get_all_values()) + 1
         end_row = start_row + len(fixed) - 1
         ws.update(f"A{start_row}:H{end_row}", fixed, value_input_option="RAW")
@@ -94,8 +95,17 @@ def append_logs(ws, rows: List[List[str]]):
 # =========================
 # Sheet cost basis
 # =========================
+def ensure_cost(ws):
+    header = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
+    vals = ws.get_values("A1:E1")
+    if not vals or [h.strip() for h in vals[0]] != header:
+        ws.update(range_name="A1:E1", values=[header])
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
+
 def _parse_num(x) -> float:
-    """Parse numbers like '$1,234.56', '1,234.56%', or plain floats/ints."""
     if isinstance(x, (int, float)):
         return float(x)
     s = (x or "").strip()
@@ -110,7 +120,6 @@ def _parse_num(x) -> float:
         return 0.0
 
 def _find_col(header: list, candidates: list, default=None):
-    """Find the first matching column name in header (case/space-insensitive)."""
     norm = {h.strip().lower(): i for i, h in enumerate(header)}
     for name in candidates:
         i = norm.get(name.strip().lower())
@@ -119,14 +128,6 @@ def _find_col(header: list, candidates: list, default=None):
     return default
 
 def read_cost(ws) -> List[dict]:
-    """
-    Read cost basis from the COST_TAB with header detection.
-    Supports either:
-      - total cost column (e.g., 'total_cost', 'invested', 'dollar_cost', 'usd_cost', 'cost')
-      - unit cost column (e.g., 'unit_cost', 'avg_cost', 'avg_price', 'price') -> multiplied by qty
-    Expected columns (any names work from the candidate lists below):
-      product/pair/symbol, qty/quantity, and either total_cost or unit_cost.
-    """
     vals = ws.get_all_values()
     if not vals or len(vals) < 2:
         return []
@@ -147,20 +148,16 @@ def read_cost(ws) -> List[dict]:
             qty = _parse_num(row[i_qty]) if i_qty is not None else _parse_num(row[1] if len(row) > 1 else 0.0)
             total_cost = None
 
-            # Prefer explicit total cost if present
             if i_total is not None and i_total < len(row) and row[i_total] not in ("", None):
                 total_cost = _parse_num(row[i_total])
 
-            # Otherwise derive from unit/avg cost
             if total_cost is None and i_unit is not None and i_unit < len(row) and row[i_unit] not in ("", None):
                 unit_cost = _parse_num(row[i_unit])
                 total_cost = qty * unit_cost
 
-            # Final fallback: assume column C was total cost if nothing matched
             if total_cost is None:
                 total_cost = _parse_num(row[2] if len(row) > 2 else 0.0)
 
-            # Guard against zeros that would blow up % math
             if qty <= 0 or total_cost <= 0:
                 continue
 
@@ -168,10 +165,9 @@ def read_cost(ws) -> List[dict]:
                 "product": product,
                 "qty": float(qty),
                 "dollar_cost": float(total_cost),
-                "rownum": r + 1,  # 1-indexed in Sheets
+                "rownum": r + 1,
             })
         except Exception:
-            # Skip malformed rows
             continue
     return out
 
@@ -186,20 +182,12 @@ def zero_cost_row(ws, rownum: int, product: str):
 # Market data / orders
 # =========================
 def last_closed_minute(dt: datetime) -> datetime:
-    """Return the previous fully closed minute (UTC)."""
-    # If it's 12:34:45 now, the last CLOSED minute is 12:33:00.
     return dt.astimezone(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=1)
 
 def price_now(product_id: str) -> float:
-    """
-    Use the most recent CLOSED 1-minute candle close as spot.
-    Robust to ordering and missing candles.
-    """
-    # Target the last closed 1m candle
     target_start_dt = last_closed_minute(datetime.now(timezone.utc))
-    # Fetch a wider window to be safe
-    end_dt = target_start_dt + timedelta(minutes=1)      # exclusive end
-    start_dt = target_start_dt - timedelta(minutes=30)   # small buffer
+    end_dt = target_start_dt + timedelta(minutes=1)
+    start_dt = target_start_dt - timedelta(minutes=30)
 
     resp = CB.get_candles(
         product_id=product_id,
@@ -211,14 +199,12 @@ def price_now(product_id: str) -> float:
     if not rows:
         raise RuntimeError("No recent candles")
 
-    # Ensure ascending by start time (some APIs return newest-first)
     try:
         rows = sorted(rows, key=lambda x: int(g(x, "start", default=0)))
     except Exception:
         pass
 
     target_start_ts = int(target_start_dt.timestamp())
-    # Prefer exact match; otherwise take the latest candle <= target
     exact = [r for r in rows if int(g(r, "start", default=-1)) == target_start_ts]
     use = exact[-1] if exact else max(
         (r for r in rows if int(g(r, "start", default=-1)) <= target_start_ts),
@@ -237,38 +223,59 @@ def price_now(product_id: str) -> float:
         print(f"[PX] {product_id} 1m_close={px} ts={g(use, 'start')}")
     return px
 
+def quantize_down(x: float, step: float) -> float:
+    q = Decimal(str(step))
+    return float(Decimal(str(x)).quantize(q))
+
+def fetch_product_rules(pid: str):
+    meta = CB.get_product(product_id=pid)
+    base_inc = float(g(meta, "base_increment", "base_size_increment", "base_min_size", default=1e-8))
+    quote_inc = float(g(meta, "quote_increment", "quote_size_increment", "quote_min_size", default=0.01))
+    min_quote = float(g(meta, "min_market_funds", "quote_min_size", "min_funds", default=1.00))
+    min_base  = float(g(meta, "min_order_size", "base_min_size", default=1e-8))
+    return base_inc, quote_inc, min_quote, min_base
+
 def place_sell(product_id: str, base_qty: float) -> str:
-    """Submit a market sell with an idempotent client_order_id."""
     if DRY_RUN:
         return "DRYRUN"
+    base_inc, _, _, min_base = fetch_product_rules(product_id)
+    qty = max(min_base, quantize_down(base_qty, base_inc))
     client_order_id = f"sell-{product_id}-{int(time.time()*1000)}"
     o = CB.market_order_sell(
         client_order_id=client_order_id,
         product_id=product_id,
-        base_size=f"{base_qty:.12f}",
+        base_size=f"{qty:.12f}",
     )
     return g(o, "order_id", "id", default=client_order_id)
 
+def _fees_sum(fills: list) -> float:
+    total_fee = 0.0
+    for x in fills:
+        fx = g(x, "fee", "fees", "commission", default=0.0)
+        try: total_fee += float(fx)
+        except: pass
+    return total_fee
+
 def poll_fills_proceeds(order_id: str) -> float:
-    """Return total USD proceeds for this order (best-effort)."""
     if DRY_RUN:
         return 0.0
     for _ in range(POLL_TRIES):
         try:
-            f = CB.get_fills(order_id=order_id)  # orders are tied to the API key's portfolio
+            f = CB.get_fills(order_id=order_id)
             fills = g(f, "fills") or (f if isinstance(f, list) else [])
             if fills:
-                total = 0.0
+                gross = 0.0
                 for x in fills:
                     qv = g(x, "quote_value", "commissionable_value")
-                    if qv is not None:
-                        total += float(qv)
+                    if qv is not None: gross += float(qv)
                     else:
                         px = float(g(x, "price", default=0) or 0)
                         sz = float(g(x, "size", default=0) or 0)
-                        total += px * sz
-                if total > 0:
-                    return total
+                        gross += px * sz
+                fee = _fees_sum(fills)
+                net = max(0.0, gross - fee)
+                if net > 0:
+                    return net
         except Exception:
             pass
         time.sleep(POLL_SEC)
@@ -278,14 +285,31 @@ def poll_fills_proceeds(order_id: str) -> float:
 # =========================
 # Main
 # =========================
+def debug_dump_cost(ws):
+    vals = ws.get_all_values()
+    print(f"[DEBUG] {COST_TAB} raw rows (excluding header): {max(0, len(vals)-1)}")
+    if vals:
+        print(f"[DEBUG] header: {vals[0]}")
+    for r in vals[1:6]:
+        print(f"[DEBUG] row: {r}")
+
 def main():
     print("🏁 crypto-seller starting")
     gc = get_gc()
     ws_log  = _ws(gc, LOG_TAB);  ensure_log(ws_log)
-    ws_cost = _ws(gc, COST_TAB)
+    ws_cost = _ws(gc, COST_TAB); ensure_cost(ws_cost)
+
+    if DEBUG_SELLER:
+        debug_dump_cost(ws_cost)
 
     target = TARGET_GAIN_PCT / 100.0
     cost_rows = read_cost(ws_cost)
+
+    if DEBUG_SELLER:
+        print(f"[DEBUG] parsed {len(cost_rows)} positions from {COST_TAB}")
+        for x in cost_rows[:10]:
+            print(f"[DEBUG] {x['product']} qty={x['qty']} dollar_cost=${x['dollar_cost']:.2f}")
+
     if not cost_rows:
         print("ℹ️ No cost basis rows; nothing to sell.")
         return
@@ -303,6 +327,19 @@ def main():
             mkt_val = qty * px
             gain = (mkt_val - dollar_cost) / dollar_cost
 
+            # Check Coinbase min quote funds to avoid dust sells
+            _, _, min_quote, _ = fetch_product_rules(pid)
+            if mkt_val < min_quote:
+                logs.append([now_iso(), "CRYPTO-SELL-SKIP", pid,
+                             f"{mkt_val:.2f}", f"{qty:.8f}", "", "SKIPPED",
+                             f"Below min quote ${min_quote:.2f} | Spot ${px:.6f}"])
+                if DEBUG_SELLER:
+                    print(f"[SKIP] {pid}: mkt ${mkt_val:.2f} < min_quote ${min_quote:.2f}")
+                continue
+
+            if DEBUG_SELLER:
+                print(f"[EVAL] {pid}: qty={qty:.8f} cost=${dollar_cost:.2f} spot=${px:.6f} gain={gain*100:.2f}%")
+
             if gain >= target:
                 oid = place_sell(pid, qty)
                 proceeds = poll_fills_proceeds(oid)
@@ -315,19 +352,18 @@ def main():
                     f"{proceeds_used:.2f}",
                     f"{qty:.8f}",
                     oid, status,
-                    f"Spot ${px:.4f} | MktVal ${mkt_val:.2f} | Gain {gain*100:.2f}% | Profit ${realized:.2f}"
+                    f"Spot ${px:.6f} | MktVal ${mkt_val:.2f} | Gain {gain*100:.2f}% | Profit ${realized:.2f}"
                 ])
 
                 if not DRY_RUN:
                     zero_cost_row(ws_cost, row["rownum"], pid)
 
-                # small jitter to avoid bursts
                 time.sleep(SLEEP_SEC * (0.8 + 0.4 * random.random()))
             else:
                 logs.append([
                     now_iso(), "CRYPTO-SELL-SKIP", pid,
                     f"{mkt_val:.2f}", f"{qty:.8f}", "", "SKIPPED",
-                    f"Spot ${px:.4f} | Gain {gain*100:.2f}% < {TARGET_GAIN_PCT:.2f}%"
+                    f"Spot ${px:.6f} | Gain {gain*100:.2f}% < {TARGET_GAIN_PCT:.2f}%"
                 ])
         except Exception as e:
             logs.append([now_iso(), "CRYPTO-SELL-ERROR", pid, "", f"{qty:.8f}", "", "ERROR", f"{type(e).__name__}: {e}"])
